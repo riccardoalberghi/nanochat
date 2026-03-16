@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 
-def _attention(q, k, v, causal=False, window_size=(-1, -1), poly_coeffs=None):
+def _attention(q, k, v, causal=False, window_size=(-1, -1), poly_beta=None):
     """
     Pure PyTorch scaled dot-product attention.
 
@@ -28,8 +28,7 @@ def _attention(q, k, v, causal=False, window_size=(-1, -1), poly_coeffs=None):
         v: (B, Tk, Hk, D)
         causal: apply causal mask
         window_size: (left, right) sliding window. -1 means unlimited.
-        poly_coeffs: optional (beta1, beta2) each shape (1, H, 1, 1) for polynomial attention:
-                     scores become beta1 * s^2 + beta2 * s instead of s
+        poly_beta: optional float for polynomial attention: scores become poly_beta * s^2 + s
 
     Returns:
         (B, Tq, Hq, D)
@@ -54,13 +53,9 @@ def _attention(q, k, v, causal=False, window_size=(-1, -1), poly_coeffs=None):
     # Compute attention scores
     attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, Tq, Tk)
 
-    # Polynomial / scaled attention
-    if poly_coeffs is not None:
-        beta1, beta2 = poly_coeffs
-        if beta1 is not None:
-            attn = beta1 * attn.square() + beta2 * attn
-        else:
-            attn = beta2 * attn
+    # Polynomial attention: poly_beta * s^2 + s
+    if poly_beta is not None:
+        attn = poly_beta * attn.square() + attn
 
     # Build mask
     if causal or (window_size[0] >= 0 and window_size[0] < Tk):
@@ -84,7 +79,7 @@ def _attention(q, k, v, causal=False, window_size=(-1, -1), poly_coeffs=None):
     return y.transpose(1, 2)   # (B, Tq, H, D)
 
 
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), poly_coeffs=None):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), poly_beta=None):
     """
     Attention for training (no KV cache).
 
@@ -92,16 +87,16 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), poly_coeffs=Non
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
-        poly_coeffs: optional (beta1, beta2) for polynomial attention
+        poly_beta: optional float for polynomial attention
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    return _attention(q, k, v, causal=causal, window_size=window_size, poly_coeffs=poly_coeffs)
+    return _attention(q, k, v, causal=causal, window_size=window_size, poly_beta=poly_beta)
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
-                            causal=False, window_size=(-1, -1), poly_coeffs=None):
+                            causal=False, window_size=(-1, -1), poly_beta=None):
     """
     Attention with KV cache for inference.
 
@@ -114,7 +109,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
         cache_seqlens: Current position in cache, shape (B,) int32
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
-        poly_coeffs: optional (beta1, beta2) for polynomial attention
+        poly_beta: optional float for polynomial attention
 
     Returns:
         Output tensor of shape (B, T_new, H, D)
@@ -132,7 +127,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     k_full = k_cache[:, :end_pos, :, :]
     v_full = v_cache[:, :end_pos, :, :]
 
-    return _attention(q, k_full, v_full, causal=causal, window_size=window_size, poly_coeffs=poly_coeffs)
+    return _attention(q, k_full, v_full, causal=causal, window_size=window_size, poly_beta=poly_beta)
 
 
 # Export: same namespace interface as before

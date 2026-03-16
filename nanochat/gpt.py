@@ -37,8 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    poly_attn: bool = False  # polynomial attention: softmax(beta1*s^2 + beta2*s) instead of softmax(s)
-    scaled_attn: bool = False  # scaled attention: softmax(beta2*s) instead of softmax(s)
+    poly_beta: float | None = None  # polynomial attention: softmax(poly_beta*s^2 + s) instead of softmax(s)
 
 
 def norm(x):
@@ -80,16 +79,8 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-        # Polynomial / scaled attention: learnable per-head coefficients
-        if config.poly_attn:
-            self.poly_beta1 = nn.Parameter(0.1 * torch.ones(self.n_head))
-            self.poly_beta2 = nn.Parameter(torch.ones(self.n_head))
-        elif config.scaled_attn:
-            self.poly_beta1 = None
-            self.poly_beta2 = nn.Parameter(torch.ones(self.n_head))
-        else:
-            self.poly_beta1 = None
-            self.poly_beta2 = None
+        # Polynomial attention: softmax(poly_beta * s^2 + s) instead of softmax(s)
+        self.poly_beta = config.poly_beta
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -113,18 +104,14 @@ class CausalSelfAttention(nn.Module):
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
-        # Polynomial / scaled attention coefficients (reshape to (1, H, 1, 1) for broadcasting)
-        poly_coeffs = None
-        if self.poly_beta2 is not None:
-            dtype = q.dtype
-            b1 = self.poly_beta1.to(dtype=dtype)[None, :, None, None] if self.poly_beta1 is not None else None
-            poly_coeffs = (b1, self.poly_beta2.to(dtype=dtype)[None, :, None, None])
+        # Polynomial attention coefficients
+        poly_beta = self.poly_beta
 
         # Attention
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, poly_coeffs=poly_coeffs)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, poly_beta=poly_beta)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -134,7 +121,7 @@ class CausalSelfAttention(nn.Module):
                 cache_seqlens=kv_cache.cache_seqlens,
                 causal=True,
                 window_size=window_size,
-                poly_coeffs=poly_coeffs,
+                poly_beta=poly_beta,
             )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
@@ -373,9 +360,8 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        poly_numel = sum(p.numel() for block in self.transformer.h for p in [block.attn.poly_beta1, block.attn.poly_beta2] if p is not None)
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters()) - poly_numel
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() + poly_numel
+        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -392,22 +378,14 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        # Poly attention betas live inside transformer.h but are scalars, not matrices — exclude from Muon
-        poly_param_ids = set()
-        poly_params = []
-        for block in self.transformer.h:
-            for p in [block.attn.poly_beta1, block.attn.poly_beta2]:
-                if p is not None:
-                    poly_params.append(p)
-                    poly_param_ids.add(id(p))
-        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in poly_param_ids]
+        matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(poly_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -422,7 +400,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-        ] + ([dict(kind='adamw', params=poly_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0)] if poly_params else [])
+        ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
