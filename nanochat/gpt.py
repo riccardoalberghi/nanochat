@@ -82,7 +82,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         # Polynomial / scaled attention: learnable per-head coefficients
         if config.poly_attn:
-            self.poly_beta1 = nn.Parameter(torch.zeros(self.n_head))
+            self.poly_beta1 = nn.Parameter(0.1 * torch.ones(self.n_head))
             self.poly_beta2 = nn.Parameter(torch.ones(self.n_head))
         elif config.scaled_attn:
             self.poly_beta1 = None
@@ -116,8 +116,9 @@ class CausalSelfAttention(nn.Module):
         # Polynomial / scaled attention coefficients (reshape to (1, H, 1, 1) for broadcasting)
         poly_coeffs = None
         if self.poly_beta2 is not None:
-            b1 = self.poly_beta1[None, :, None, None] if self.poly_beta1 is not None else None
-            poly_coeffs = (b1, self.poly_beta2[None, :, None, None])
+            dtype = q.dtype
+            b1 = self.poly_beta1.to(dtype=dtype)[None, :, None, None] if self.poly_beta1 is not None else None
+            poly_coeffs = (b1, self.poly_beta2.to(dtype=dtype)[None, :, None, None])
 
         # Attention
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
@@ -395,9 +396,10 @@ class GPT(nn.Module):
         poly_param_ids = set()
         poly_params = []
         for block in self.transformer.h:
-            if block.attn.poly_beta1 is not None:
-                poly_params.extend([block.attn.poly_beta1, block.attn.poly_beta2])
-                poly_param_ids.update({id(block.attn.poly_beta1), id(block.attn.poly_beta2)})
+            for p in [block.attn.poly_beta1, block.attn.poly_beta2]:
+                if p is not None:
+                    poly_params.append(p)
+                    poly_param_ids.add(id(p))
         matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in poly_param_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
@@ -420,7 +422,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-        ] + ([dict(kind='adamw', params=poly_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)] if poly_params else [])
+        ] + ([dict(kind='adamw', params=poly_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0)] if poly_params else [])
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
