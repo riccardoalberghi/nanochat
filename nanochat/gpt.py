@@ -9,7 +9,7 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
-- Flash Attention 3 integration
+- Pure PyTorch attention (hackable, no precompiled kernels)
 """
 
 from functools import partial
@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
-# Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
+# Pure PyTorch attention (hackable, no precompiled kernels)
 from nanochat.flash_attention import flash_attn
 
 @dataclass
@@ -37,6 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    poly_attn: bool = False  # polynomial attention: softmax(beta1*s^2 + beta2*s) instead of softmax(s)
+    scaled_attn: bool = False  # scaled attention: softmax(beta2*s) instead of softmax(s)
 
 
 def norm(x):
@@ -78,12 +80,22 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Polynomial / scaled attention: learnable per-head coefficients
+        if config.poly_attn:
+            self.poly_beta1 = nn.Parameter(torch.zeros(self.n_head))
+            self.poly_beta2 = nn.Parameter(torch.ones(self.n_head))
+        elif config.scaled_attn:
+            self.poly_beta1 = None
+            self.poly_beta2 = nn.Parameter(torch.ones(self.n_head))
+        else:
+            self.poly_beta1 = None
+            self.poly_beta2 = None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        # Shape: (B, T, H, D)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -101,11 +113,17 @@ class CausalSelfAttention(nn.Module):
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
-        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
+        # Polynomial / scaled attention coefficients (reshape to (1, H, 1, 1) for broadcasting)
+        poly_coeffs = None
+        if self.poly_beta2 is not None:
+            b1 = self.poly_beta1[None, :, None, None] if self.poly_beta1 is not None else None
+            poly_coeffs = (b1, self.poly_beta2[None, :, None, None])
+
+        # Attention
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, poly_coeffs=poly_coeffs)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -115,6 +133,7 @@ class CausalSelfAttention(nn.Module):
                 cache_seqlens=kv_cache.cache_seqlens,
                 causal=True,
                 window_size=window_size,
+                poly_coeffs=poly_coeffs,
             )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
@@ -281,7 +300,7 @@ class GPT(nn.Module):
         """
         Compute per-layer window sizes for sliding window attention.
 
-        Returns list of (left, right) tuples for FA3's window_size parameter:
+        Returns list of (left, right) tuples for the attention window_size parameter:
         - left: how many tokens before current position to attend to (-1 = unlimited)
         - right: how many tokens after current position to attend to (0 for causal)
 
@@ -292,7 +311,7 @@ class GPT(nn.Module):
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
         # Map characters to window sizes
         long_window = config.sequence_len
-        short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
+        short_window = -(-long_window // 4 // 128) * 128  # ceil to 128 boundary (2048 -> 768)
         char_to_window = {
             "L": (long_window, 0),
             "S": (short_window, 0),
@@ -353,8 +372,9 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        poly_numel = sum(p.numel() for block in self.transformer.h for p in [block.attn.poly_beta1, block.attn.poly_beta2] if p is not None)
+        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters()) - poly_numel
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() + poly_numel
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -371,14 +391,21 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Poly attention betas live inside transformer.h but are scalars, not matrices — exclude from Muon
+        poly_param_ids = set()
+        poly_params = []
+        for block in self.transformer.h:
+            if block.attn.poly_beta1 is not None:
+                poly_params.extend([block.attn.poly_beta1, block.attn.poly_beta2])
+                poly_param_ids.update({id(block.attn.poly_beta1), id(block.attn.poly_beta2)})
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in poly_param_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(poly_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -393,7 +420,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
+        ] + ([dict(kind='adamw', params=poly_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)] if poly_params else [])
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

@@ -81,11 +81,11 @@ def use_calculator(expr):
 # -----------------------------------------------------------------------------
 class KVCache:
     """
-    KV Cache designed for Flash Attention 3's flash_attn_with_kvcache API.
+    KV Cache for autoregressive inference.
 
-    Key differences from FA2-style cache:
-    - Tensors are (B, T, H, D) not (B, H, T, D)
-    - FA3 updates the cache in-place during flash_attn_with_kvcache
+    Layout:
+    - Tensors are (B, T, H, D)
+    - Cache is updated in-place during flash_attn_with_kvcache
     - Position tracked per batch element via cache_seqlens tensor
     """
 
@@ -98,7 +98,7 @@ class KVCache:
         # Pre-allocate cache tensors: (n_layers, B, T, H, D)
         self.k_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
         self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-        # Current sequence length per batch element (FA3 needs int32)
+        # Current sequence length per batch element
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
         # Previous token's normalized embedding for smear (set by model forward pass)
         self.prev_embedding = None
